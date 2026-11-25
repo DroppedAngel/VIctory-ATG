@@ -1889,6 +1889,20 @@ mod tests {
         }
     }
 
+    /// The container's shader hash part names the shader to tools and
+    /// drivers: it holds a digest, and changes with the code.
+    #[test]
+    #[cfg(windows)]
+    fn the_hash_part_changes_with_the_code() {
+        let hash_part = |c: &[u8]| {
+            let at = c.windows(4).position(|w| w == b"HASH").expect("a HASH part");
+            c[at + 8..at + 28].to_vec()
+        };
+        let (a, b) = (hash_part(&constant_color()), hash_part(&super::host::stub_ps().dxil));
+        assert_ne!(a[4..], [0u8; 16], "no digest");
+        assert_ne!(a, b, "two programs with one hash");
+    }
+
     #[test]
     #[cfg(windows)]
     fn constant_color_validates() {

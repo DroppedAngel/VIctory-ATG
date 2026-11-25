@@ -981,13 +981,24 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
         if self.mesh.is_some() {
             parts.push((b"PSG1", &psg1));
         }
+        // The shader hash part: flags (0: of the binary alone), then a
+        // digest of the binary, as the host's own compiler writes it. It was
+        // left at zero, so every translated shader carried the same one;
+        // tools and drivers that know a shader by this part could not tell
+        // ours apart.
+        let mut hash = [0u8; 20];
+        let mut hashed = dxil.clone();
+        for (_, part) in &parts {
+            hashed.extend(*part);
+        }
+        hashed.extend(&psv0);
+        hash[4..].copy_from_slice(&container::hash(&hashed));
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
         container::build(&parts)
     }
