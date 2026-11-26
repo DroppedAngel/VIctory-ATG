@@ -3160,6 +3160,8 @@ impl HostHeap {
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
+        } else if let Some(cached) = cached_null_handle(NullKind::Tex2d) {
+            self.copy_from(index, cached);
         } else {
             null_view(self.at(index));
             self.put(index);
@@ -3191,8 +3193,12 @@ impl HostHeap {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            null_buffer_view(self.at(self.raw + index));
-            self.put(self.raw + index);
+            if let Some(cached) = cached_null_handle(NullKind::RawBuffer) {
+                self.copy_from(self.raw + index, cached);
+            } else {
+                null_buffer_view(self.at(self.raw + index));
+                self.put(self.raw + index);
+            }
         }
     }
 
@@ -3702,9 +3708,13 @@ impl HostHeap {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
-            }
-            if kept.is_some() || !self.sampler {
+                if let Some(cached) = cached_null_for(&view) {
+                    self.copy_from(index, cached);
+                } else {
+                    null_for(&view, self.at(index));
+                    self.put(index);
+                }
+            } else if kept.is_some() {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
@@ -5135,9 +5145,25 @@ impl Copied<'_> {
 
 /// The records (`step` bytes each, the first is slot `first`) that differ
 /// between `last` and `records` (of one length) go into `out` and `last`.
-/// Most of a changed page is as it was: it is looked at sixteen records at a
-/// time.
+/// View heaps use 32-byte records (one AVX2 YMM register per descriptor),
+/// scanned 4 slots (128 bytes) at a time with zero branch per unchanged slot.
 fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    #[cfg(target_arch = "x86_64")]
+    if step == 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 availability checked at runtime above.
+        unsafe { changed_records_avx2_32(last, records, first, out) };
+        return;
+    }
+    changed_records_scalar(last, records, step, first, out);
+}
+
+fn changed_records_scalar(
+    last: &mut [u8],
+    records: &[u8],
+    step: usize,
+    first: u32,
+    out: &mut Vec<u32>,
+) {
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {
@@ -5153,9 +5179,86 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
     }
 }
 
+/// AVX2 fast path for 32-byte view descriptor records: compares 4 slots
+/// (128 bytes) per iteration using 256-bit vector XOR + OR + PTEST.
+///
+/// # Safety
+/// Caller must ensure the CPU supports AVX2 (`is_x86_feature_detected!("avx2")`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_records_avx2_32(
+    last: &mut [u8],
+    records: &[u8],
+    first: u32,
+    out: &mut Vec<u32>,
+) {
+    use std::arch::x86_64::*;
+
+    let count = last.len().min(records.len()) / 32;
+    let lp = last.as_mut_ptr();
+    let rp = records.as_ptr();
+    let mut i = 0usize;
+
+    while i + 4 <= count {
+        let off = i * 32;
+        // SAFETY: `i + 4 <= count` guarantees `off + 128 <= last.len().min(records.len())`.
+        unsafe {
+            let o0 = _mm256_loadu_si256(lp.add(off).cast());
+            let n0 = _mm256_loadu_si256(rp.add(off).cast());
+            let o1 = _mm256_loadu_si256(lp.add(off + 32).cast());
+            let n1 = _mm256_loadu_si256(rp.add(off + 32).cast());
+            let o2 = _mm256_loadu_si256(lp.add(off + 64).cast());
+            let n2 = _mm256_loadu_si256(rp.add(off + 64).cast());
+            let o3 = _mm256_loadu_si256(lp.add(off + 96).cast());
+            let n3 = _mm256_loadu_si256(rp.add(off + 96).cast());
+
+            let d0 = _mm256_xor_si256(o0, n0);
+            let d1 = _mm256_xor_si256(o1, n1);
+            let d2 = _mm256_xor_si256(o2, n2);
+            let d3 = _mm256_xor_si256(o3, n3);
+            let any = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+
+            if _mm256_testz_si256(any, any) == 0 {
+                if _mm256_testz_si256(d0, d0) == 0 {
+                    _mm256_storeu_si256(lp.add(off).cast(), n0);
+                    out.push(first + i as u32);
+                }
+                if _mm256_testz_si256(d1, d1) == 0 {
+                    _mm256_storeu_si256(lp.add(off + 32).cast(), n1);
+                    out.push(first + (i + 1) as u32);
+                }
+                if _mm256_testz_si256(d2, d2) == 0 {
+                    _mm256_storeu_si256(lp.add(off + 64).cast(), n2);
+                    out.push(first + (i + 2) as u32);
+                }
+                if _mm256_testz_si256(d3, d3) == 0 {
+                    _mm256_storeu_si256(lp.add(off + 96).cast(), n3);
+                    out.push(first + (i + 3) as u32);
+                }
+            }
+        }
+        i += 4;
+    }
+
+    while i < count {
+        let off = i * 32;
+        // SAFETY: `i < count` guarantees `off + 32 <= last.len().min(records.len())`.
+        unsafe {
+            let o = _mm256_loadu_si256(lp.add(off).cast());
+            let n = _mm256_loadu_si256(rp.add(off).cast());
+            let d = _mm256_xor_si256(o, n);
+            if _mm256_testz_si256(d, d) == 0 {
+                _mm256_storeu_si256(lp.add(off).cast(), n);
+                out.push(first + i as u32);
+            }
+        }
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod changed_records_tests {
-    use super::changed_records;
+    use super::{changed_records, changed_records_scalar};
 
     #[test]
     fn changed_records_are_those_that_differ_one_by_one() {
@@ -5166,6 +5269,7 @@ mod changed_records_tests {
                 (seed >> 33) as usize
             };
             let mut last: Vec<u8> = (0..step * count).map(|_| random() as u8).collect();
+            let mut last_scalar = last.clone();
             let mut now = last.clone();
             let mut differ = Vec::new();
             for slot in 0..count {
@@ -5175,13 +5279,55 @@ mod changed_records_tests {
                 }
             }
             let mut out = Vec::new();
+            let mut out_scalar = Vec::new();
             changed_records(&mut last, &now, step, 1000, &mut out);
+            changed_records_scalar(&mut last_scalar, &now, step, 1000, &mut out_scalar);
             assert_eq!(out, differ);
+            assert_eq!(out, out_scalar);
             assert_eq!(last, now);
+            assert_eq!(last, last_scalar);
             out.clear();
             changed_records(&mut last, &now, step, 1000, &mut out);
             assert!(out.is_empty());
         }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark comparing AVX2 vs scalar descriptor diff on 500k slots"]
+    fn bench_changed_records_500k_slots() {
+        const SLOTS: usize = 500_000;
+        const STEP: usize = 32;
+        const RUNS: usize = 20;
+        let base = vec![0x5Au8; SLOTS * STEP];
+        let mut now = base.clone();
+        // ~1% dirty slots (typical of 500k–970k scanned, ~5k–10k mirrored)
+        for slot in (0..SLOTS).step_by(97) {
+            now[slot * STEP + 7] ^= 0xFF;
+        }
+        let mut out = Vec::with_capacity(8192);
+        let t0 = std::time::Instant::now();
+        for _ in 0..RUNS {
+            let mut last = base.clone();
+            out.clear();
+            changed_records_scalar(&mut last, &now, STEP, 0, &mut out);
+            std::hint::black_box(&out);
+        }
+        let scalar_ms = t0.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+        let expected = out.len();
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..RUNS {
+            let mut last = base.clone();
+            out.clear();
+            changed_records(&mut last, &now, STEP, 0, &mut out);
+            std::hint::black_box(&out);
+        }
+        let avx2_ms = t1.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+        assert_eq!(out.len(), expected);
+        println!(
+            "changed_records 500k x 32B ({expected} dirty): scalar={scalar_ms:.2} ms, avx2={avx2_ms:.2} ms ({:.1}% faster)",
+            (1.0 - avx2_ms / scalar_ms) * 100.0
+        );
     }
 }
 
@@ -5358,6 +5504,149 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Pre-built CPU-only null descriptor slots so `make_null`, `clear_twin`, and
+/// deferred `mirror()` calls perform a single `CopyDescriptorsSimple` instead
+/// of `Create*View` + `CopyDescriptorsSimple` (~20k+ calls/frame).
+#[derive(Clone, Copy)]
+enum NullKind {
+    Tex2d = 0,
+    RawBuffer = 1,
+    Cbv = 2,
+    UavBuffer = 3,
+    UavTex1d = 4,
+    UavTex1dArray = 5,
+    UavTex2d = 6,
+    UavTex2dArray = 7,
+    UavTex3d = 8,
+    SrvDimBase = 9, // 9..=17 for SRV dimensions 2..=10
+}
+
+const NULL_CACHE_SLOTS: u32 = 18;
+
+fn cached_null_handle(kind: NullKind) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    cached_null_slot(kind as u32)
+}
+
+fn cached_null_slot(slot: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    struct Cache {
+        start: usize,
+        step: usize,
+        _heap: ID3D12DescriptorHeap,
+    }
+    // SAFETY: CPU-only descriptor heap initialized once and read-only afterwards.
+    unsafe impl Send for Cache {}
+    // SAFETY: as above.
+    unsafe impl Sync for Cache {}
+    static CACHE: std::sync::OnceLock<Option<Cache>> = std::sync::OnceLock::new();
+    let cache = CACHE
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: plain CPU-only descriptor heap creation.
+            let heap: ID3D12DescriptorHeap = unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: NULL_CACHE_SLOTS,
+                    ..Default::default()
+                })
+            }
+            .ok()?;
+            // SAFETY: live heap, plain queries.
+            let (start, step) = unsafe {
+                (
+                    heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                    host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+                )
+            };
+            let handle = |idx: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: start + idx as usize * step,
+            };
+            null_view(handle(NullKind::Tex2d as u32));
+            null_buffer_view(handle(NullKind::RawBuffer as u32));
+            // SAFETY: CPU-only heap slot; zero location creates a null CBV.
+            unsafe {
+                let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                host.device.CreateConstantBufferView(Some(&cbv), handle(NullKind::Cbv as u32));
+                let uav_buf = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    ..Default::default()
+                };
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&uav_buf),
+                    handle(NullKind::UavBuffer as u32),
+                );
+                for (idx, dim) in [
+                    (NullKind::UavTex1d as u32, Some(D3D12_UAV_DIMENSION_TEXTURE1D.0 as u32)),
+                    (NullKind::UavTex1dArray as u32, Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY.0 as u32)),
+                    (NullKind::UavTex2d as u32, Some(D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32)),
+                    (NullKind::UavTex2dArray as u32, Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32)),
+                    (NullKind::UavTex3d as u32, Some(D3D12_UAV_DIMENSION_TEXTURE3D.0 as u32)),
+                ] {
+                    let desc = null_uav_desc(dim);
+                    host.device.CreateUnorderedAccessView(
+                        None::<&ID3D12Resource>,
+                        None::<&ID3D12Resource>,
+                        Some(&desc),
+                        handle(idx),
+                    );
+                }
+            }
+            for dim in 2u32..=10 {
+                let mut w = [0u32; 10];
+                w[1] = dim;
+                null_like(&w, handle(NullKind::SrvDimBase as u32 + (dim - 2)));
+            }
+            Some(Cache { start, step, _heap: heap })
+        })
+        .as_ref()?;
+    (slot < NULL_CACHE_SLOTS).then(|| D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: cache.start + slot as usize * cache.step,
+    })
+}
+
+fn cached_null_for(view: &View) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    let srv_dim = |dim: u32| {
+        if (2..=10).contains(&dim) {
+            cached_null_slot(NullKind::SrvDimBase as u32 + (dim - 2))
+        } else {
+            cached_null_handle(NullKind::Tex2d)
+        }
+    };
+    let uav_slot = |buffer: bool, dimension: Option<u32>| {
+        if buffer {
+            return cached_null_handle(NullKind::UavBuffer);
+        }
+        let kind = match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+            Some(D3D12_UAV_DIMENSION_TEXTURE1D) => NullKind::UavTex1d,
+            Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => NullKind::UavTex1dArray,
+            Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => NullKind::UavTex2dArray,
+            Some(D3D12_UAV_DIMENSION_TEXTURE3D) => NullKind::UavTex3d,
+            _ => NullKind::UavTex2d,
+        };
+        cached_null_handle(kind)
+    };
+    match view {
+        View::Unordered(r, _, desc) => uav_slot(
+            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+            desc.map(|d| d[1]),
+        ),
+        View::Placed(true, resource, desc) => uav_slot(resource[0] == 1, Some(desc[1])),
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
+            cached_null_handle(NullKind::RawBuffer)
+        }
+        View::Placed(false, resource, _) if resource[0] == 1 => {
+            cached_null_handle(NullKind::RawBuffer)
+        }
+        View::Shader(_, Some(desc)) => srv_dim(desc[1]),
+        View::Placed(false, _, desc) => srv_dim(desc[1]),
+        View::Constant(..) => cached_null_handle(NullKind::Cbv),
+        _ => cached_null_handle(NullKind::Tex2d),
+    }
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
