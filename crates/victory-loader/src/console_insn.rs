@@ -135,6 +135,105 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
+    // SAFETY: as for this function.
+    unsafe { patch_to_stub(at, [a, b, c, d, e], 0, |stub| clzero_stub(at, stub, [x, y, z])) }
+}
+
+/// Whether an `extrq` or `insertq` with its field in the instruction is replaced the first time
+/// it faults by a jump to the same work in SSE2 ([`sse4a_stub`]). Play run of 2026-11-25: 191-491
+/// exceptions a second at peak, 442 a second at one place alone, and no such place was ever
+/// replaced. On by default; `VICTORY_PATCH_SSE4A=0` emulates each time, as before.
+fn patches_sse4a() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_SSE4A").is_none_or(|v| v != "0"))
+}
+
+/// The `extrq` or `insertq` of `len` bytes at `at` as SSE2 code at `stub`, entered 16 bytes in
+/// (the first 16 are the bits `insertq` keeps); `None` for the forms with the field in a
+/// register. Only XMM registers change, as from the instruction, and the high quadword of the
+/// destination is zeroed as the emulation does. `insertq` borrows a third register, saved on
+/// the stack and back.
+fn sse4a_stub(what: ConsoleOnly, at: usize, len: usize, stub: usize) -> Option<Vec<u8>> {
+    // `op xmm(reg), xmm(rm)` after `prefix`, with REX.R and REX.B where needed
+    fn op(prefix: u8, code: u8, reg: u8, rm: u8) -> Vec<u8> {
+        let rex = (reg & 8) >> 1 | (rm & 8) >> 3;
+        let mut v = vec![prefix];
+        if rex != 0 {
+            v.push(0x40 | rex);
+        }
+        v.extend([0x0f, code, 0xc0 | (reg & 7) << 3 | rm & 7]);
+        v
+    }
+    // psrlq (`down`) or psllq by `by`, nothing for 0
+    fn shift(down: bool, x: u8, by: u32) -> Vec<u8> {
+        if by == 0 {
+            return Vec::new();
+        }
+        let mut v = op(0x66, 0x73, if down { 2 } else { 6 }, x);
+        v.push(by as u8);
+        v
+    }
+    let field = |len: u8, idx: u8| (if len & 63 == 0 { 64 } else { (len & 63) as u32 }, (idx & 63) as u32);
+    let mut code = vec![0; 16];
+    match what {
+        ConsoleOnly::Extrq { dst, src: None, len: l, idx } => {
+            let (l, idx) = field(l, idx);
+            code.extend(shift(true, dst, idx));
+            code.extend(shift(false, dst, 64 - l));
+            code.extend(shift(true, dst, 64 - l));
+            code.extend(op(0xf3, 0x7e, dst, dst)); // movq dst, dst
+        }
+        ConsoleOnly::Insertq { dst, src, reg: false, len: l, idx } => {
+            let (l, idx) = field(l, idx);
+            let ones = if l >= 64 { u64::MAX } else { (1 << l) - 1 };
+            code[..8].copy_from_slice(&(!ones.checked_shl(idx).unwrap_or(0)).to_le_bytes());
+            let t = (0..3).find(|&t| t != dst && t != src)?;
+            code.extend([0x48, 0x8d, 0x64, 0x24, 0xf0]); // lea rsp, [rsp - 16]
+            code.extend([0xf3, 0x0f, 0x7f, t << 3 | 4, 0x24]); // movdqu [rsp], t
+            code.extend(op(0xf3, 0x7e, t, src)); // movq t, src
+            code.extend(shift(false, t, 64 - l));
+            code.extend(shift(true, t, 64 - l));
+            code.extend(shift(false, t, idx));
+            // pand dst, [the kept bits]
+            if dst >= 8 {
+                code.extend([0x66, 0x44]);
+            } else {
+                code.push(0x66);
+            }
+            let disp = -i32::try_from(code.len() + 7).ok()?;
+            code.extend([0x0f, 0xdb, (dst & 7) << 3 | 5]);
+            code.extend(disp.to_le_bytes());
+            code.extend(op(0x66, 0xeb, dst, t)); // por dst, t
+            code.extend([0xf3, 0x0f, 0x6f, t << 3 | 4, 0x24]); // movdqu t, [rsp]
+            code.extend([0x48, 0x8d, 0x64, 0x24, 0x10]); // lea rsp, [rsp + 16]
+        }
+        _ => return None,
+    }
+    let end = stub + code.len();
+    code.extend(jump(end, at + len)?);
+    Some(code)
+}
+
+/// Replaces the `extrq` or `insertq` of `len` bytes at `at`, whose bytes are `code`, by a jump
+/// to its [`sse4a_stub`]: whether it did. The jump takes 5 of its 6 or 7 bytes; nothing jumps
+/// into the middle of an instruction.
+///
+/// # Safety
+/// `at` is in the title's code, which stays mapped.
+unsafe fn patch_sse4a(at: usize, code: &[u8], len: usize, what: ConsoleOnly) -> bool {
+    let &[a, b, c, d, e, ..] = code else {
+        return false;
+    };
+    // SAFETY: as for this function.
+    len > 5 && patches_sse4a() && unsafe { patch_to_stub(at, [a, b, c, d, e], 16, |stub| sse4a_stub(what, at, len, stub)) }
+}
+
+/// Puts the code `body` makes for its address in [`STUBS`] and replaces the 5 bytes at `at`,
+/// which are `was`, by a jump to `entry` bytes into it: whether it did.
+///
+/// # Safety
+/// `at` is in the title's code, which stays mapped, and the code does what was there.
+unsafe fn patch_to_stub(at: usize, was: [u8; 5], entry: usize, body: impl FnOnce(usize) -> Option<Vec<u8>>) -> bool {
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
@@ -143,7 +242,7 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
         return false;
     };
     let stub = *place + *used;
-    let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
+    let (Some(body), Some(jump)) = (body(stub), jump(at, stub + entry)) else {
         return false;
     };
     if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
@@ -153,7 +252,7 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     unsafe {
         std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
         *used += body.len().next_multiple_of(16);
-        patch(at, [a, b, c, d, e], jump)
+        patch(at, was, jump)
     }
 }
 
@@ -497,7 +596,13 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             *regs[r as usize & 15] = cpu;
         }
         // the low quadword changes; the high one is zeroed, as a Zen 5 does
-        ConsoleOnly::Extrq { dst, src, len, idx } => {
+        ConsoleOnly::Extrq { dst, src, len: l, idx } => {
+            // (and not again where the field is in the instruction: the next time it is SSE2)
+            // SAFETY: the title's code, where the instruction just faulted.
+            if unsafe { patch_sse4a(rip, code, len, what) } {
+                #[cfg(feature = "diagnostics")]
+                sites::patched();
+            }
             // SAFETY: the context's XMM registers (CONTEXT_FLOATING_POINT is captured for exceptions).
             let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
             let (len, idx) = match src {
@@ -505,17 +610,22 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                     let c = x[s as usize & 15].Low;
                     (c as u8, (c >> 8) as u8)
                 }
-                None => (len, idx),
+                None => (l, idx),
             };
             let d = &mut x[dst as usize & 15];
             d.Low = decode::extrq(d.Low, len, idx);
             d.High = 0;
         }
-        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
+        ConsoleOnly::Insertq { dst, src, reg, len: l, idx } => {
+            // SAFETY: as above.
+            if unsafe { patch_sse4a(rip, code, len, what) } {
+                #[cfg(feature = "diagnostics")]
+                sites::patched();
+            }
             // SAFETY: as above.
             let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
             let s = x[src as usize & 15];
-            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
+            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (l, idx) };
             let d = &mut x[dst as usize & 15];
             d.Low = decode::insertq(d.Low, s.Low, len, idx);
             d.High = 0;
@@ -649,5 +759,100 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+    }
+
+    /// `extrq` and `insertq` with the field in the instruction run as SSE2 once replaced: the
+    /// destination as the emulation leaves it, the source and the borrowed register as they were.
+    #[test]
+    fn an_extrq_or_insertq_becomes_sse2() {
+        use windows_sys::Win32::System::Diagnostics::Debug::M128A;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        let (d_in, s_in) = (0x0123_4567_89ab_cdefu64, 0xfedc_ba98_7654_3210u64);
+        // The bytes, destination, source, where in its 16 bytes it lies, and whether it fits there.
+        let cases: [(&[u8], u8, Option<u8>, usize, bool); 6] = [
+            (&[0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10], 0, Some(1), 1, true), // the play run's busiest
+            (&[0x66, 0x0f, 0x78, 0xc2, 0x08, 0x14], 2, None, 7, true),
+            (&[0xf2, 0x45, 0x0f, 0x78, 0xc8, 0x0c, 0x38], 9, Some(8), 11, true),
+            (&[0x66, 0x41, 0x0f, 0x78, 0xc1, 0x00, 0x04], 9, None, 3, true),
+            (&[0xf2, 0x0f, 0x78, 0xc9, 0x05, 0x03], 1, Some(1), 0, true),
+            (&[0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10], 0, Some(1), 12, false),
+        ];
+        for (insn, dst, src, offset, fits) in cases {
+            let (what, len) = decode::decode(insn).unwrap();
+            let s = src.unwrap_or(dst);
+            let d_in = if src == Some(dst) { s_in } else { d_in };
+            let expected = match what {
+                ConsoleOnly::Extrq { len, idx, .. } => decode::extrq(d_in, len, idx),
+                ConsoleOnly::Insertq { len, idx, .. } => decode::insertq(d_in, s_in, len, idx),
+                _ => unreachable!(),
+            };
+            // A function of (destination, source, out): xmm8 and xmm9 kept for the caller,
+            // xmm0-2 all ones, both loaded into both halves, then the instruction, and the
+            // destination, the source and xmm0-2 stored.
+            let movq = |x: u8, gpr: u8| [0x66, 0x48 | (x & 8) >> 1, 0x0f, 0x6e, 0xc0 | (x & 7) << 3 | gpr];
+            let both = |x: u8| [0x66, if x >= 8 { 0x45 } else { 0x40 }, 0x0f, 0x6c, 0xc0 | (x & 7) * 9];
+            let store = |x: u8, at: u8| [0xf3, 0x41 | (x & 8) >> 1, 0x0f, 0x7f, 0x40 | (x & 7) << 3, at];
+            let mut code = vec![0x48, 0x8d, 0x64, 0x24, 0xd8];
+            code.extend([0xf3, 0x44, 0x0f, 0x7f, 0x04, 0x24, 0xf3, 0x44, 0x0f, 0x7f, 0x4c, 0x24, 0x10]);
+            code.extend([0x66, 0x0f, 0x76, 0xc0, 0x66, 0x0f, 0x76, 0xc9, 0x66, 0x0f, 0x76, 0xd2]);
+            code.extend(movq(dst, 1));
+            code.extend(both(dst));
+            if src.is_some() {
+                code.extend(movq(s, 2));
+                code.extend(both(s));
+            }
+            while code.len() % 16 != offset {
+                code.push(0x90);
+            }
+            let here = code.len();
+            code.extend(insn);
+            code.extend(store(dst, 0));
+            code.extend(store(s, 16));
+            for x in 0..3 {
+                code.extend(store(x, 32 + 16 * x));
+            }
+            code.extend([0xf3, 0x44, 0x0f, 0x6f, 0x04, 0x24, 0xf3, 0x44, 0x0f, 0x6f, 0x4c, 0x24, 0x10]);
+            code.extend([0x48, 0x8d, 0x64, 0x24, 0x28, 0xc3]);
+            // SAFETY: memory of our own, written and run inside it.
+            unsafe {
+                let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                assert_ne!(page, 0);
+                std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+                // The fault: emulated, and replaced.
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = (page + here) as u64;
+                let x = &mut context.Anonymous.FltSave.XmmRegisters;
+                x[dst as usize] = M128A { Low: d_in, High: d_in as i64 };
+                if src.is_some() {
+                    x[s as usize] = M128A { Low: s_in, High: s_in as i64 };
+                }
+                assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+                assert_eq!(context.Rip, (page + here + len) as u64);
+                let d = context.Anonymous.FltSave.XmmRegisters[dst as usize];
+                assert_eq!((d.Low, d.High), (expected, 0), "emulated {what:?}");
+                let now = std::slice::from_raw_parts((page + here) as *const u8, len);
+                if !patches_sse4a() || !fits {
+                    assert_eq!(now, insn, "left alone");
+                } else {
+                    assert_eq!(now[0], 0xe9, "a jump");
+                    let run: extern "system" fn(u64, u64, *mut [u64; 10]) = std::mem::transmute(page);
+                    let mut out = [0u64; 10];
+                    run(d_in, s_in, &mut out);
+                    assert_eq!(out[..2], [expected, 0], "{what:?}");
+                    if src.is_some_and(|s| s != dst) {
+                        assert_eq!(out[2..4], [s_in, s_in], "the source kept: {what:?}");
+                    }
+                    for x in 0..3u8 {
+                        if x != dst && x != s {
+                            let at = 4 + 2 * x as usize;
+                            assert_eq!(out[at..at + 2], [u64::MAX; 2], "xmm{x} kept: {what:?}");
+                        }
+                    }
+                }
+                VirtualFree(page as *mut _, 0, MEM_RELEASE);
+            }
+        }
+        let register = ConsoleOnly::Insertq { dst: 0, src: 1, reg: true, len: 0, idx: 0 };
+        assert!(sse4a_stub(register, 0x1000, 5, 0x2000).is_none(), "the field in a register");
     }
 }
