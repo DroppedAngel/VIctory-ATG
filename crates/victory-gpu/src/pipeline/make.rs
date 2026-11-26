@@ -231,8 +231,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        // A dispatch's compute pipeline (passes over the screen have their
+        // own queue and budget): first in the queue, and waited for.
+        let compute = is_compute(p) && !p.screen;
+        start(p, if compute && urgent_compute() { URGENT } else { REQUESTED });
+        let frame = crate::frame::current();
+        if !(compute && wait_compute(p, frame)) {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -271,6 +277,83 @@ pub(crate) fn early(p: &Arc<Pending>) {
 fn shared_budget() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+}
+
+/// Waiting allowed for one compute pipeline and for all of a title
+/// frame's: `VICTORY_COMPUTE_WAIT=<per pipeline ms>,<per frame ms>`
+/// (default 5000,15000; 0: no such wait, the frame's budget as for draws).
+fn compute_wait() -> (Duration, Duration) {
+    static WAIT: OnceLock<(Duration, Duration)> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_COMPUTE_WAIT").unwrap_or_default();
+        let mut parts = value.split(',').map(|v| v.trim().parse::<u64>().ok());
+        let per = parts.next().flatten().unwrap_or(5000);
+        let frame = parts.next().flatten().unwrap_or(15_000);
+        (Duration::from_millis(per), Duration::from_millis(frame))
+    })
+}
+
+/// A dispatch waits for its compute pipeline being made (first in the
+/// queue, [`urgent_compute`]) up to [`compute_wait`]'s time for it and
+/// what is left of the frame's, instead of being dropped after the frame's
+/// half-second budget for draws: a compute pass often keeps state from
+/// frame to frame, which a launch that drops it never gets back. In a cold
+/// launch the world's first frame asks for some 1,900 pipelines; the
+/// compute ones were made 20 to 85 s later, and the launch kept a broken
+/// head for the main character (no ponytail, no face) to its end (run
+/// vt-g-ss-cold; the same with the frame's budget raised to 15 s,
+/// vt-g-ss-coldwait-a). Capped, because a wait for every pipeline the
+/// title asks for ended the title (72 s into a cold launch's first world
+/// frame) and the title's watchdog is 30 s. False if there is no such wait
+/// left (the caller waits on the frame's budget).
+fn wait_compute(p: &Pending, frame: u64) -> bool {
+    // The frame the waits belong to, waited so far, pipelines waited for,
+    // and of them those not made in time.
+    static SPENT: Mutex<(u64, Duration, u32, u32)> = Mutex::new((u64::MAX, Duration::ZERO, 0, 0));
+    let (per, cap) = compute_wait();
+    let left = {
+        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 != frame {
+            // The frame before, if it waited long: for the caps' measure.
+            if spent.1 >= Duration::from_secs(1) {
+                tracing::info!(
+                    frame = spent.0,
+                    ms = spent.1.as_millis() as u64,
+                    pipelines = spent.2,
+                    not_in_time = spent.3,
+                    "dispatches waited for their compute pipelines"
+                );
+            }
+            *spent = (frame, Duration::ZERO, 0, 0);
+        }
+        per.min(cap.saturating_sub(spent.1))
+    };
+    if left.is_zero() {
+        return false;
+    }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 == frame {
+        spent.1 += started.elapsed();
+        spent.2 += 1;
+        spent.3 += u32::from(p.made.get().is_none());
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::PipelineWaitUs,
+        started.elapsed().as_micros() as u64,
+    );
+    true
 }
 
 /// Waits for `p` while frame `frame` has budget left.
@@ -342,7 +425,28 @@ fn wait(p: &Pending, frame: u64) {
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+/// A compute pipeline a dispatch asked for ([`urgent_compute`]).
+const URGENT: u8 = 3;
+const MAKING: u8 = 4;
+
+/// Whether a compute pipeline a dispatch asks for goes ahead of every other
+/// queued pipeline but the passes over the screen, not in turn behind the
+/// draws' (`VICTORY_COMPUTE_FIRST=0`: in turn, as before). A cold launch's
+/// first world frame asks for some 1,900 pipelines at once, made in the
+/// order asked: the compute chain that keeps a persistent 384x384 lighting
+/// map (ef05293f, 4ceef06f, f42a5dca, 5b2ce592, 89106710) was made 80 s
+/// after it was first bound (vt-g-ss-cold), the passes reading its map ran
+/// meanwhile, and compute passes keep state from frame to frame like that;
+/// a draw dropped for a frame leaves nothing behind.
+fn urgent_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Whether `p` is a compute pipeline (one compute shader).
+fn is_compute(p: &Pending) -> bool {
+    matches!(&p.shaders[..], [s] if s.stage == "compute")
+}
 
 /// How many workers may make pipelines at once that are known to take long
 /// and that no draw has asked for: a quarter of them. On a fresh cache (a
@@ -367,6 +471,8 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Compute pipelines dispatches asked for ([`URGENT`]): next.
+    urgent: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -379,6 +485,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            urgent: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -398,7 +505,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.screen && screens_first() {
+        if priority == URGENT {
+            self.urgent.push_back(p.clone());
+        } else if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
@@ -411,13 +520,17 @@ impl Queue {
     }
 
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
-        // An early entry can have been promoted and claimed already.
-        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
-            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        // An entry can have been promoted (and claimed from the list it was
+        // promoted to) since it was queued: only taken at its state.
+        let at = |list: &mut VecDeque<Arc<Pending>>, state: u8| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
         };
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| at(list, EARLY);
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = at(&mut self.urgent, URGENT)
+                .or_else(|| at(&mut self.requested, REQUESTED))
+                .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -656,6 +769,35 @@ mod tests {
         assert!(queue.pop(false, 1).is_none());
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    /// A compute pipeline a dispatch asks for is made after the passes over
+    /// the screen and before every draw's and early pipeline queued before
+    /// it, once (also when it was queued early or as a draw's first).
+    #[test]
+    fn dispatches_pipelines_go_first_and_once() {
+        let of = |screen| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = screen;
+            Arc::new(p)
+        };
+        let (early, drawn, chain, screen) = (of(false), of(false), of(false), of(true));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&early, EARLY), Some(true));
+        assert_eq!(queue.push(&chain, EARLY), Some(true));
+        assert_eq!(queue.push(&drawn, REQUESTED), Some(true));
+        assert_eq!(queue.push(&chain, REQUESTED), Some(false));
+        // The dispatch asks: promoted ahead of the draw queued before it.
+        assert_eq!(queue.push(&chain, URGENT), Some(false));
+        assert_eq!(queue.push(&chain, URGENT), None);
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &screen));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &chain));
+        assert_eq!(queue.push(&chain, URGENT), None);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &drawn));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early));
         assert!(queue.pop(false, 1).is_none());
     }
 
