@@ -485,13 +485,45 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
+/// Whether this run loads pipelines from the library and stores them in it;
+/// set when the library is opened ([`loads_from`]).
+static LOADS: AtomicBool = AtomicBool::new(true);
+
+/// Whether pipelines come from the library: `VICTORY_LIBRARY_LOAD=1` or `0`,
+/// else only on an AMD card. On NVIDIA (RTX 4090) the library's copies of
+/// pipelines draw wrong in a share of launches: the warm launches of the
+/// prologue's cell that loaded a library a cold launch had saved showed flat
+/// bands of colour (Vice-Tay's README lists them as unexplained) in 5 of 6
+/// launches, 1 of 3 with comparison pipelines kept out ([`kept_out`]), 1 of 3
+/// with a real shader hash too, and 0 of 6 that loaded none. Without it every
+/// pipeline is made, as on a first launch, and the early list still starts
+/// the early ones while the title loads: the cell came at 89 s instead of
+/// 75 and ran at 63.3 ms a frame instead of 62.1 (VIctory-reloaded runs
+/// vt-g-ss-nolib against fab5286's warm launch).
+fn loads_from(var: Option<&std::ffi::OsStr>, amd: bool) -> bool {
+    var.map_or(amd, |v| v == "1")
+}
+
+/// Whether this run loads pipelines from the library ([`loads_from`]).
+#[cfg(test)]
+pub(crate) fn loads() -> bool {
+    library().is_some() && LOADS.load(Ordering::Relaxed)
+}
+
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let loads = loads_from(std::env::var_os("VICTORY_LIBRARY_LOAD").as_deref(), crate::indirect::amd(&device));
+            LOADS.store(loads, Ordering::Relaxed);
+            if !loads {
+                tracing::info!("host pipeline library not loaded on this card (VICTORY_LIBRARY_LOAD=1 loads it)");
+            }
+            // An empty library without loads: it stores nothing, so only the
+            // early list is saved.
+            let blob = if loads { DIR.get().map_or(Blob::None, |d| Blob::of(d)) } else { Blob::None };
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -586,7 +618,7 @@ pub(crate) fn pipeline(
         create()
     };
     let wide = HSTRING::from(name);
-    let Some(library) = library().filter(|_| !KEPT_OUT.get()) else {
+    let Some(library) = library().filter(|_| !KEPT_OUT.get() && LOADS.load(Ordering::Relaxed)) else {
         MADE.fetch_add(1, Ordering::Relaxed);
         if KEPT_OUT.get() {
             UNSTORED.fetch_add(1, Ordering::Relaxed);
@@ -874,6 +906,17 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The library is loaded on AMD cards and not on others, unless
+    /// `VICTORY_LIBRARY_LOAD` says.
+    #[test]
+    fn the_library_loads_on_amd_alone_unless_asked() {
+        let var = |v: &'static str| Some(std::ffi::OsStr::new(v));
+        assert!(loads_from(None, true));
+        assert!(!loads_from(None, false));
+        assert!(loads_from(var("1"), false));
+        assert!(!loads_from(var("0"), true));
+    }
 
     /// Pipelines with a static comparison sampler stay out of the library
     /// (`kept_out`), the others go in.

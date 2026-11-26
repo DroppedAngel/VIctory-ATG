@@ -1137,6 +1137,10 @@ mod tests {
             eprintln!("no PC dxc.exe; skipped");
             return;
         };
+        if !super::super::library::loads() {
+            eprintln!("the library is not loaded on this card (VICTORY_LIBRARY_LOAD=1); skipped");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
