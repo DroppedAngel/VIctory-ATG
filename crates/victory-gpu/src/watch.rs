@@ -335,10 +335,20 @@ struct Journal {
     /// from the journal, without another kernel call.
     ahead: Ahead,
     ahead_asked: u64,
+    /// The title mapping revision when the standing query began.
+    ahead_mapping: u64,
+    /// A verified raw copy let this query stand past a title-memory write.
+    kept_after_raw: bool,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+}
+
+impl Journal {
+    fn covers(&self, first: usize, last: usize) -> bool {
+        (!self.kept_after_raw || self.ahead_mapping == changes()) && self.ahead.holds(first, last)
+    }
 }
 
 /// Read by many threads at once (a submission's refreshes run on several),
@@ -351,6 +361,8 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     notes: Notes::new(),
     ahead: Ahead::new(),
     ahead_asked: 0,
+    ahead_mapping: 0,
+    kept_after_raw: false,
     kept: false,
 });
 
@@ -1054,15 +1066,16 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
+    let mapping = changes();
     ask_ahead_held(ranges, true);
     spent.next("asking: the rest");
-    ask_rest(ranges, true);
+    ask_rest(ranges, true, mapping);
     spent.end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
-fn ask_rest(ranges: &[(usize, usize)], held: bool) {
+fn ask_rest(ranges: &[(usize, usize)], held: bool, mapping: u64) {
     let _all = (!held).then(Asking::hold_all);
     let mut ahead = {
         let mut j = journal_mut();
@@ -1113,6 +1126,8 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         let now = note_shared(&written);
         let mut j = journal_mut();
         j.ahead_asked = now;
+        j.ahead_mapping = mapping;
+        j.kept_after_raw = false;
         j.kept = !ahead.is_empty();
         j.ahead.set(ahead);
         return;
@@ -1120,6 +1135,8 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     let mut j = journal_mut();
     let now = next_asking();
     j.ahead_asked = now;
+    j.ahead_mapping = mapping;
+    j.kept_after_raw = false;
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
@@ -1179,6 +1196,7 @@ pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        j.kept_after_raw = false;
         j.ahead.clear();
     }
 }
@@ -1209,6 +1227,72 @@ pub(crate) fn wrote(at: usize, len: usize) {
         for other in others {
             j.notes.note(other / PAGE, WHOLE, now);
         }
+    }
+}
+
+/// Bound the extra kernel probe for a raw copy to 256 KiB.
+pub(crate) const RAW_COPY_WATCH_LIMIT: usize = 256 << 10;
+
+pub(crate) struct RawCopyNote {
+    first: usize,
+    last: usize,
+    mapping: u64,
+}
+
+/// Prepare a note for a raw copy while its mapping is held. Covered ranges
+/// were write-watched when queried. Confirm the current destination with a
+/// non-resetting probe, since a raw address can name a mapped alias.
+pub(crate) fn prepare_raw_copy_note(_reading: &Reading, at: usize, len: usize) -> Option<RawCopyNote> {
+    if len == 0 {
+        return None;
+    }
+    let end = at.checked_add(len)?;
+    let (first, last) = (at / PAGE, end.div_ceil(PAGE));
+    let mapping = changes();
+    {
+        let j = journal();
+        if !j.kept || j.ahead_mapping != mapping || !j.covers(first, last) {
+            return None;
+        }
+    }
+
+    let mut addresses = [0usize; RAW_COPY_WATCH_LIMIT / KERNEL_PAGE];
+    if last - first > addresses.len() / (PAGE / KERNEL_PAGE) {
+        return None;
+    }
+    let bytes = (last - first) * PAGE;
+    let mut count = bytes / KERNEL_PAGE;
+    let mut granularity = 0;
+    // SAFETY: the answer fits in `addresses`. Flag 0 keeps the reported bits.
+    let result = unsafe {
+        windows_sys::Win32::System::Memory::GetWriteWatch(
+            0,
+            (first * PAGE) as *const _,
+            bytes,
+            addresses.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    };
+    (result == 0).then_some(RawCopyNote { first, last, mapping })
+}
+
+impl RawCopyNote {
+    pub(crate) fn written(self, _reading: &Reading) -> bool {
+        let mut j = journal_mut();
+        if !j.kept {
+            return true;
+        }
+        if changes() != self.mapping || j.ahead_mapping != self.mapping || !j.covers(self.first, self.last) {
+            return false;
+        }
+        let now = next_asking();
+        j.ahead_asked = now;
+        j.kept_after_raw = true;
+        for page in self.first..self.last {
+            j.notes.note(page, WHOLE, now);
+        }
+        true
     }
 }
 
@@ -1249,7 +1333,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
+    j.covers(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -1262,7 +1346,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
-    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)));
+    let ahead = |j: &Journal| j.covers(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)));
     // A fresh number and the notes of the range, its parts held meanwhile
     // (renderer port #7, switch or not: who notes shared takes its number
     // holding the parts it notes in).
@@ -1384,7 +1468,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.holds(first, last) {
+    if !known && !j.covers(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -3577,10 +3661,9 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 }
 
 
-/// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
+/// The runtime is about to change a mapping or free a title allocation.
+/// Until this guard is dropped, reads of title memory in place stay paused
+/// ([`title_memory_reading`]). Hold it through the whole change.
 pub fn title_memory_remapping() -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
@@ -4341,6 +4424,7 @@ mod tests {
     /// copied.
     #[test]
     fn the_rest_of_the_one_asking_has_a_number_of_its_own() {
+        let _one = one_asking_test();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
@@ -4352,12 +4436,118 @@ mod tests {
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
-        ask_rest(&ranges, false);
+        ask_rest(&ranges, false, changes());
         let last = journal().notes.range(p / PAGE + 1, p / PAGE + 2).first().map(|n| n.1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_raw_copy_in_watched_memory_keeps_the_other_asked_ranges() {
+        let _one = one_asking_test();
+        let reading = title_memory_reading();
+        // SAFETY: a private write-watched allocation owned by the test.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let other = (p + 2 * PAGE, p + 3 * PAGE);
+        ask_once(&[(p, p + PAGE), other]);
+        let (old, other_notes) = asked(other.0, other.1).expect("queried before the copy");
+        assert!(prepare_raw_copy_note(&reading, other.1, 1).is_none());
+        let note = prepare_raw_copy_note(&reading, p, 1).expect("watched destination");
+        // SAFETY: one byte in the allocation above.
+        unsafe { (p as *mut u8).write_volatile(0x53) };
+        assert!(note.written(&reading));
+        let (now, notes) = asked(p, p + PAGE).expect("the query still covers the destination");
+        assert!(now > old);
+        assert!(notes.contains(&(p / PAGE, now)));
+        assert_eq!(asked(other.0, other.1), Some((now, other_notes)));
+        assert!(kernel_written(p / PAGE, p / PAGE + 1).is_some_and(|pages| !pages.is_empty()));
+        drop(reading);
+        {
+            use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+            let _changing = title_memory_remapping();
+            title_memory_freed(p, 4 * PAGE);
+            // SAFETY: decommit and recommit the test's reservation in place.
+            unsafe {
+                assert_ne!(VirtualFree(p as *mut _, 4 * PAGE, MEM_DECOMMIT), 0);
+                assert_eq!(VirtualAlloc(p as *const _, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, p);
+                (other.0 as *mut u8).write_volatile(0x65);
+            }
+        }
+        assert!(asked(other.0, other.1).is_none());
+        assert!(writes(other.0, other.1, false).is_some_and(|(_, pages)| {
+            pages.iter().any(|&(page, wrote)| page == other.0 / PAGE && wrote > now)
+        }));
+        ask_once_end();
+
+        // A stale address in the index is not proof of a current watched allocation.
+        let reading = title_memory_reading();
+        // SAFETY: another private allocation, with no write watch enabled.
+        let plain = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(plain, 0);
+        {
+            let mut j = journal_mut();
+            j.ahead.set(vec![(plain / PAGE, plain / PAGE + 1)]);
+            j.ahead_mapping = changes();
+            j.kept = true;
+        }
+        assert!(prepare_raw_copy_note(&reading, plain, 1).is_none());
+        ask_once_end();
+        // SAFETY: freed once, after all test queries.
+        unsafe {
+            VirtualFree(plain as *mut _, 0, MEM_RELEASE);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn a_raw_copy_between_freshly_queried_ranges() {
+        let _one = one_asking_test();
+        let reading = title_memory_reading();
+        let ranges: Vec<_> = (0..16)
+            .map(|_| {
+                // SAFETY: separate write-watched allocations owned by the benchmark.
+                let p = unsafe {
+                    VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+                } as usize;
+                assert_ne!(p, 0);
+                (p, p + PAGE)
+            })
+            .collect();
+        let dst = ranges[0].0;
+        let mut samples = [Vec::new(), Vec::new()];
+        for trial in 0..256 {
+            for keep in [trial % 2 == 0, trial % 2 != 0] {
+                ask_once(&ranges);
+                let began = std::time::Instant::now();
+                let note = keep.then(|| prepare_raw_copy_note(&reading, dst, 1).expect("watched destination"));
+                // SAFETY: the first byte of the benchmark's first allocation.
+                unsafe { (dst as *mut u8).write_volatile(trial as u8) };
+                if let Some(note) = note {
+                    assert!(note.written(&reading));
+                } else {
+                    ask_once_end();
+                }
+                for &(start, end) in &ranges {
+                    std::hint::black_box(writes(start, end, false).expect("watched"));
+                }
+                samples[usize::from(keep)].push(began.elapsed().as_secs_f64() * 1e6);
+                ask_once_end();
+            }
+        }
+        for sample in &mut samples {
+            sample.sort_by(f64::total_cmp);
+        }
+        println!("raw copy and 16 refresh queries: reask {:.2} us, keep {:.2} us (medians)", samples[0][128], samples[1][128]);
+        for (start, _) in ranges {
+            // SAFETY: freed once, after all benchmark queries.
+            unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
+        }
     }
 
     /// The runtime maps a view and then tells us; a copy's refresh on another
