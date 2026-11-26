@@ -587,6 +587,9 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Made every launch, never stored or loaded, with a comparison
+        // sampler (`library::kept_out`).
+        let _out = super::library::keep_out(super::library::kept_out(&samplers));
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {

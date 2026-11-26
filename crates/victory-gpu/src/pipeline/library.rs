@@ -255,6 +255,49 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The pipeline this thread is making stays out of the library
+    /// ([`keep_out`]).
+    static KEPT_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pipelines made and kept out of the library ([`kept_out`]), since the start.
+pub(crate) static UNSTORED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a pipeline with these static samplers stays out of the library:
+/// made every launch, never stored or loaded. One with a comparison sampler
+/// does (filter bit 0x80, which the maximum reduction 0x180 has too).
+///
+/// The driver's copy of such a pipeline that a library keeps runs as if
+/// that sampler were a point sampler without comparison. In our earlier
+/// tree (its ecbb1e7) the shadow tests of the title's deferred lighting
+/// (ab5455fc6abb804f) then all passed and every warm launch that loaded it
+/// showed a pale picture: one dispatch captured from a good launch and run
+/// again offline computed with the live pipeline what a fresh compile does,
+/// and with the copy that launch saved in its library exactly what a
+/// compile with that sampler made a point sampler does. The library refuses
+/// an entry to a root signature with other samplers, so it is the stored
+/// binary itself. `VICTORY_LIBRARY_COMPARISON=1` stores them as before.
+pub(crate) fn kept_out(samplers: &[D3D12_STATIC_SAMPLER_DESC]) -> bool {
+    static STORE: OnceLock<bool> = OnceLock::new();
+    const COMPARISON: i32 = 0x80;
+    !*STORE.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_COMPARISON").is_some_and(|v| v == "1"))
+        && samplers.iter().any(|s| s.Filter.0 & COMPARISON != 0)
+}
+
+/// While the guard lives, the pipelines this thread makes stay out of the
+/// library if `out` ([`kept_out`]).
+pub(crate) fn keep_out(out: bool) -> KeepOut {
+    KEPT_OUT.set(out);
+    KeepOut
+}
+
+/// See [`keep_out`].
+pub(crate) struct KeepOut;
+
+impl Drop for KeepOut {
+    fn drop(&mut self) {
+        KEPT_OUT.set(false);
+    }
 }
 
 /// Names the pipeline this thread makes next.
@@ -543,8 +586,11 @@ pub(crate) fn pipeline(
         create()
     };
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    let Some(library) = library().filter(|_| !KEPT_OUT.get()) else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        if KEPT_OUT.get() {
+            UNSTORED.fetch_add(1, Ordering::Relaxed);
+        }
         return create();
     };
     let began = std::time::Instant::now();
@@ -676,6 +722,7 @@ pub(crate) fn save(now: bool) {
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            kept_out = UNSTORED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
@@ -827,6 +874,21 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pipelines with a static comparison sampler stay out of the library
+    /// (`kept_out`), the others go in.
+    #[test]
+    fn comparison_samplers_keep_a_pipeline_out() {
+        let sampler = |filter: i32| D3D12_STATIC_SAMPLER_DESC { Filter: D3D12_FILTER(filter), ..Default::default() };
+        // The deferred lighting's: linear, linear, point, comparison, point.
+        let lighting = [sampler(0x15), sampler(0x14), sampler(0), sampler(0x95), sampler(0)];
+        assert!(kept_out(&lighting));
+        assert!(kept_out(&[sampler(0x80)]));
+        assert!(kept_out(&[sampler(0x180)]), "the maximum reduction has the bit too");
+        assert!(!kept_out(&lighting[..3]));
+        assert!(!kept_out(&[sampler(0x55), sampler(0x100)]));
+        assert!(!kept_out(&[]));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
