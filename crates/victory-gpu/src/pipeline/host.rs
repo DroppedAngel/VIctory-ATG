@@ -1393,10 +1393,16 @@ mod tests {
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
         graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made again");
-        assert!(
-            super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
-            "the depth-bounds pipeline was compiled again instead of loaded from the library"
-        );
+        // Where the library does not load (NVIDIA unless VICTORY_LIBRARY_LOAD=1)
+        // the pipeline is made again; the draws below are checked either way.
+        if super::super::library::loads() {
+            assert!(
+                super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
+                "the depth-bounds pipeline was compiled again instead of loaded from the library"
+            );
+        } else {
+            eprintln!("the library is not loaded on this card (VICTORY_LIBRARY_LOAD=1); load check skipped");
+        }
 
         // Execute two draws against a depth buffer cleared to 0.5:
         // 1) bounds [0.6, 1.0] -> rejected (target stays 0)
