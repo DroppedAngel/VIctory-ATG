@@ -42,7 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
-) -> Result<u32> {
+) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
@@ -58,29 +58,24 @@ pub fn run(
         victory_hle::modules::xmem::low_guards::install();
     }
     let cfg = victory_core::Config::load()?;
-    // Before the import registry is first used: it holds the module only
-    // when the host's FidelityFX serves.
-    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
-    let prepared = victory_loader::prepare(
-        &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
-    )?;
+    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
-        Some(build) => {
-            println!("build          {} ({hash})", build.label);
-            if execute {
-                check_startup_archive(&title_dir.join(build.startup_archive))?;
-            }
-        }
+        Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
-    // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
+    // The program is mapped from the copy `load` wrote: the file's bytes
+    // and their patched copy are not read again, and were held for the
+    // whole run (two blocks of 114.7 MB each for the title, in
+    // physical memory: run 65's memory map).
+    let image_name = prepared.file_name();
     drop(prepared);
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -94,6 +89,7 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -172,11 +168,73 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, and nothing of it has run yet.
+        unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+    }
+    // Renderer port #2 (VICTORY_PORT_DESCRIPTORS=1): the title's stores of
+    // descriptor records tell the layer their slots.
+    #[cfg(windows)]
+    if execute && victory_hle::port_descriptors::on() {
+        use victory_loader::descriptor_sites::{Hooked, SITES, apply};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and the
+        // marks are a static.
+        let done = unsafe { apply(image.base(), size, victory_hle::port_descriptors::marks_address(), &SITES) };
+        let patched = done.iter().filter(|d| **d == Hooked::Done).count();
+        println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
+        victory_hle::port_descriptors::hooked(image.base(), size, patched);
+        // VICTORY_PORT_COPIES=1: the frame allocator's table copies the six
+        // stores miss (its own memcpy, a 128-byte copy) mark their slots too.
+        // A third fewer records left to the fallback (runs pop-4/pop-5), no
+        // change seen in the picture (POPIN.md): off by default.
+        if std::env::var("VICTORY_PORT_COPIES").is_ok_and(|v| v.trim() == "1") {
+            use victory_loader::descriptor_sites::{TITLE_MEMCPY, apply_copies};
+            let hook = victory_hle::port_descriptors::title_copy_hook(image.base() + TITLE_MEMCPY);
+            // SAFETY: as above; the hook is a function of ours.
+            let done = unsafe { apply_copies(image.base(), size, victory_hle::port_descriptors::marks_address(), hook) };
+            let copies = done.iter().filter(|d| **d == Hooked::Done).count();
+            println!("renderer port 2: {copies} of {} table copies of the title patched", done.len());
+        }
+    }
+    // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
+    // clock ticks at that interval (victory-gpu), and the title is given
+    // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
+    // overrides it; `off` leaves the title alone).
+    #[cfg(windows)]
+    if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
+        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+        let asked = std::env::var("VICTORY_TITLE_FPS").ok();
+        match title_rate(ms, asked.as_deref()) {
+            Some(rate) => {
+                let size = image.info().size_of_image as usize;
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                let done = unsafe { apply(image.base(), size, rate, &SITES) };
+                let patched = done.iter().filter(|d| **d == Patched::Done).count();
+                println!(
+                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                    SITES.len(),
+                    title_interval_us(rate, false)
+                );
+            }
+            None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
+        }
+    }
+    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
+    // VICTORY_UPSCALER; each off without it).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
-        return Ok(0);
+        return Ok(());
     }
     victory_loader::report_crashes();
+    victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -197,28 +255,8 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_hle::known_pipelines::flush();
     println!("title exited with {code}");
-    Ok(code)
-}
-
-#[cfg(windows)]
-fn check_startup_archive(path: &Path) -> Result<()> {
-    use std::io::Read;
-
-    let mut magic = [0; 4];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .with_context(|| {
-            format!(
-                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
-                path.display()
-            )
-        })?;
-    anyhow::ensure!(
-        magic == *b"9FPR",
-        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
-        path.display()
-    );
     Ok(())
 }
 
@@ -227,8 +265,10 @@ fn check_startup_archive(path: &Path) -> Result<()> {
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    timers(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
@@ -273,6 +313,46 @@ fn watch(base: usize, size: usize) {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// Debugging aid: `VICTORY_TIMER_LOG=1` logs the title's timers once a
+/// second (`victory_loader::frame_rate`): its frame time and limiter flag,
+/// and each timer's two times, step in seconds and in milliseconds. Whether
+/// game time keeps to the wall clock at any frame rate is read from these.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn timers(base: usize, size: usize) {
+    use victory_loader::frame_rate::{FRAME_US, LIMITER_ON, TIMERS};
+    if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
+        return;
+    }
+    if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let u32_at = |rva: usize| {
+            // SAFETY: inside the mapped image (checked above), title data.
+            unsafe { ((base + rva) as *const u32).read_volatile() }
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let timers: Vec<String> = TIMERS
+                .iter()
+                .map(|&t| {
+                    let step = f32::from_bits(u32_at(t + 0xc));
+                    format!("{} {} {step:.4} {}", u32_at(t), u32_at(t + 4), u32_at(t + 0x10))
+                })
+                .collect();
+            eprintln!(
+                "VIctory: the title's timers at {} ms: frame_us {} limiter {} frames {}; timers (time ms, frames, step s, step ms): {}",
+                start.elapsed().as_millis(),
+                u32_at(FRAME_US),
+                u32_at(LIMITER_ON) & 0xff,
+                victory_hle::frames_begun(),
+                timers.join(" | ")
+            );
         }
     });
 }
@@ -331,7 +411,7 @@ fn absent_title_dlls(
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
@@ -379,12 +459,25 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
-                for (name, dll) in &new {
+                // All of them bound before any is known as an image: a load
+                // that fails here leaves none behind, unattached, for the
+                // next `LoadLibrary` of its name to return.
+                let bound = new.iter().try_for_each(|(name, dll)| {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",
                         dll.base()
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
+                    anyhow::Ok(())
+                });
+                if let Err(error) = bound {
+                    for (_, dll) in new {
+                        // SAFETY: never attached, and no title code holds it.
+                        unsafe { dll.unload() };
+                    }
+                    return Err(error);
+                }
+                for (name, dll) in &new {
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.
@@ -553,6 +646,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

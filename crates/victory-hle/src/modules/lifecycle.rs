@@ -96,20 +96,6 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
-/// The stand-in window shown for a title window (a property of the title's).
-const STAND_IN: PCWSTR = w!("victory.standin");
-
-// The window the player sees is never the title's. A title makes its window
-// on one of its own threads and reads its messages only when that thread
-// gets round to it, which in a slow frame or a load is seconds apart; the
-// system then shows the busy cursor over the window, and a click turns it
-// into a "Not responding" ghost. So a top-level title window is made
-// message-only (never shown), and a stand-in with the title's text, style
-// and (fitted) size is shown in its place, owned by a thread of ours that
-// does nothing but read its messages. The title loses nothing: its input
-// comes from GameInput (polled, not window messages), and frames are
-// presented to the visible window of the process, the stand-in.
-
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -124,29 +110,15 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let top = parent.is_null();
-    // SAFETY: the title's own arguments, forwarded (a top-level window
-    // made message-only).
+    let (ex_style, style, (x, y, width, height)) = place(ex_style, style, parent, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size fitted, or the
+    // window made full screen).
     let hwnd = unsafe {
         wm::CreateWindowExW(
-            ex_style,
-            class,
-            name,
-            style,
-            x,
-            y,
-            width,
-            height,
-            if top { wm::HWND_MESSAGE } else { parent },
-            menu,
-            instance,
-            param,
+            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
     hook(hwnd);
-    if top {
-        stand_in(hwnd, ex_style, style, x, y, width, height);
-    }
     hwnd
 }
 
@@ -165,34 +137,124 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let top = parent.is_null();
-    // SAFETY: the title's own arguments, forwarded (a top-level window
-    // made message-only).
+    let (ex_style, style, (x, y, width, height)) = place(ex_style, style, parent, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size fitted, or the
+    // window made full screen).
     let hwnd = unsafe {
         wm::CreateWindowExA(
-            ex_style,
-            class,
-            name,
-            style,
-            x,
-            y,
-            width,
-            height,
-            if top { wm::HWND_MESSAGE } else { parent },
-            menu,
-            instance,
-            param,
+            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
     hook(hwnd);
-    if top {
-        stand_in(hwnd, ex_style, style, x, y, width, height);
-    }
     hwnd
 }
 
-/// A console title sizes its window to its render target (Grand Theft
-/// Auto VI: 3840x2160 on a Series X), which can exceed the host's screen.
+/// Where a window the title makes goes: full screen ([`full_screen`]), or
+/// fitted to the screen ([`fit`]); with the styles it gets.
+fn place(
+    ex_style: u32,
+    style: u32,
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, u32, (i32, i32, i32, i32)) {
+    let fitted = fit(parent, x, y, width, height);
+    // SAFETY: plain queries of the primary monitor's size.
+    let screen = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
+    let full = full_screen(ex_style, style, !parent.is_null(), screen);
+    if full.is_some() {
+        // A window that could go full screen: how it goes back to a window
+        // ([`toggle_full_screen`]).
+        *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) = Some((ex_style, style, fitted));
+    }
+    if full_screen_on()
+        && let Some(full) = full
+    {
+        tracing::info!(width = screen.0, height = screen.1, "title window made full screen");
+        FULL_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        return full;
+    }
+    (ex_style, style, fitted)
+}
+
+/// The styles and place the title's top-level window had (or would have
+/// had) as a window, for going back from full screen.
+type Windowed = (u32, u32, (i32, i32, i32, i32));
+static WINDOWED: Mutex<Option<Windowed>> = Mutex::new(None);
+/// Whether the title's window is full screen now.
+static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
+
+/// F11 or Alt+Enter on the title's window: full screen (frameless, over the
+/// monitor it is on) or back to the window it was made as, whichever it is
+/// not now. The swap chain stretches to either.
+fn toggle_full_screen(hwnd: HWND) {
+    let Some(windowed) = *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) else { return };
+    let full = FULL_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: queries of the title's window and the monitor it is on.
+    let monitor = unsafe {
+        let mut info: windows_sys::Win32::Graphics::Gdi::MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of_val(&info) as u32;
+        let on = windows_sys::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
+        (windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(on, &mut info) != 0).then_some(info.rcMonitor)
+    };
+    let Some(monitor) = monitor else { return };
+    let (ex_style, style, (x, y, w, h)) = toggled(full, windowed, monitor);
+    // SAFETY: the title's own window, on its own thread (this procedure).
+    unsafe {
+        wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style as isize);
+        wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, ex_style as isize);
+        wm::SetWindowPos(hwnd, std::ptr::null_mut(), x, y, w, h, wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_SHOWWINDOW);
+    }
+    FULL_SCREEN.store(!full, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(full_screen = !full, "the title's window switched");
+}
+
+/// The styles and place after a switch from full screen (`full`) or to it:
+/// back to `windowed`, or a frameless popup over `monitor`. Visible either way.
+fn toggled(full: bool, windowed: Windowed, monitor: RECT) -> Windowed {
+    if full {
+        let (ex_style, style, place) = windowed;
+        return (ex_style, style | wm::WS_VISIBLE, place);
+    }
+    let (ex_style, style, _) = windowed;
+    let (w, h) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
+    let (ex_style, style, _) =
+        full_screen(ex_style, style | wm::WS_VISIBLE, false, (w, h)).unwrap_or((ex_style, style, (0, 0, w, h)));
+    (ex_style, style, (monitor.left, monitor.top, w, h))
+}
+
+/// A key that switches full screen: F11, or Enter with Alt.
+fn switches_full_screen(message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+    const VK_RETURN: usize = 0x0D;
+    const VK_F11: usize = 0x7A;
+    let alt = (lparam >> 29) & 1 != 0;
+    (message == wm::WM_KEYDOWN && wparam == VK_F11) || (message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && alt)
+}
+
+/// `VICTORY_FULLSCREEN=1`: the title's windows fill the whole primary monitor
+/// with no frame, as a console fills its screen (the swap chain stretches
+/// to the window).
+fn full_screen_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"))
+}
+
+/// The styles and place of a full-screen window on a screen of `screen`
+/// pixels: a frameless popup over all of it. None for a window that keeps
+/// its own (one with a parent or owner, a child, a tool window).
+fn full_screen(ex_style: u32, style: u32, parented: bool, screen: (i32, i32)) -> Option<(u32, u32, (i32, i32, i32, i32))> {
+    if parented || style & wm::WS_CHILD != 0 || ex_style & wm::WS_EX_TOOLWINDOW != 0 || screen.0 <= 0 || screen.1 <= 0 {
+        return None;
+    }
+    let kept = wm::WS_VISIBLE | wm::WS_DISABLED | wm::WS_CLIPCHILDREN | wm::WS_CLIPSIBLINGS;
+    let frame = wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE;
+    Some((ex_style & !frame, wm::WS_POPUP | (style & kept), (0, 0, screen.0, screen.1)))
+}
+
+/// A console title sizes its window to its render target (
+/// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
@@ -270,149 +332,6 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
-/// Shows a stand-in for the top-level title window `title` (see
-/// [`STAND_IN`]); `ShowWindow` on `title` then shows or hides the stand-in.
-fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, height: i32) {
-    if title.is_null() {
-        return;
-    }
-    let (x, y, width, height) = fit(std::ptr::null_mut(), x, y, width, height);
-    let mut text = vec![0u16; 512];
-    // SAFETY: a window this thread just created; the buffer holds 512
-    // characters. Its icon, if its class has one.
-    let (icon, text) = unsafe {
-        let n = wm::GetWindowTextW(title, text.as_mut_ptr(), text.len() as i32);
-        text.truncate(n.max(0) as usize);
-        text.push(0);
-        (wm::GetClassLongPtrW(title, wm::GCLP_HICON), text)
-    };
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("victory-window".into())
-        .spawn(move || {
-            let window = make_stand_in(&text, ex_style, style, (x, y, width, height), icon);
-            let _ = sender.send(window as usize);
-            if !window.is_null() {
-                pump();
-            }
-        });
-    let window = match spawned {
-        Ok(_) => receiver.recv().unwrap_or(0) as HWND,
-        Err(_) => std::ptr::null_mut(),
-    };
-    if window.is_null() {
-        tracing::warn!("no stand-in window; the title's own window is not shown");
-        return;
-    }
-    // SAFETY: the title's window, on the thread that made it.
-    unsafe { wm::SetPropW(title, STAND_IN, window) };
-}
-
-/// The stand-in window for `stand_in`, on the calling thread.
-fn make_stand_in(
-    text: &[u16],
-    ex_style: u32,
-    style: u32,
-    (x, y, width, height): (i32, i32, i32, i32),
-    icon: usize,
-) -> HWND {
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    const CLASS: PCWSTR = w!("VIctory.title");
-    // SAFETY: registers our class (again is harmless) and creates a window
-    // of it; `text` is NUL-terminated.
-    unsafe {
-        let instance = GetModuleHandleW(std::ptr::null());
-        let class = wm::WNDCLASSEXW {
-            cbSize: size_of::<wm::WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(stand_in_proc),
-            hInstance: instance,
-            hCursor: wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW),
-            lpszClassName: CLASS,
-            ..std::mem::zeroed()
-        };
-        wm::RegisterClassExW(&class);
-        let window = wm::CreateWindowExW(
-            ex_style,
-            CLASS,
-            text.as_ptr(),
-            style,
-            x,
-            y,
-            width,
-            height,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            instance,
-            std::ptr::null(),
-        );
-        if !window.is_null() && icon != 0 {
-            for kind in [wm::ICON_BIG, wm::ICON_SMALL] {
-                wm::SendMessageW(window, wm::WM_SETICON, kind as usize, icon as isize);
-            }
-        }
-        window
-    }
-}
-
-/// Destroys a stand-in (posted when the title's window goes).
-const DESTROY_STAND_IN: u32 = wm::WM_APP + 0x7649;
-
-extern "system" fn stand_in_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match message {
-        // A user close (close button, Alt+F4, window or taskbar menu).
-        wm::WM_CLOSE => {
-            end_title("window closed", Box::new(|| {}));
-            return 0;
-        }
-        // No window menu from the keyboard (see `window_proc`): here it
-        // would stop only this thread, but it takes keys the title wants.
-        wm::WM_SYSCOMMAND if wparam & 0xFFF0 == wm::SC_KEYMENU as usize => return 0,
-        DESTROY_STAND_IN => {
-            // SAFETY: our window, on its thread.
-            unsafe { wm::DestroyWindow(hwnd) };
-            return 0;
-        }
-        // SAFETY: ends `pump`, the loop of this window's thread.
-        wm::WM_DESTROY => unsafe { wm::PostQuitMessage(0) },
-        _ => {}
-    }
-    // SAFETY: the default handling for our window.
-    unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) }
-}
-
-/// The message loop of a stand-in's thread, until its window is destroyed.
-fn pump() {
-    // SAFETY: the standard message loop of this thread's window.
-    unsafe {
-        let mut message: wm::MSG = std::mem::zeroed();
-        while wm::GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
-            wm::TranslateMessage(&message);
-            wm::DispatchMessageW(&message);
-        }
-    }
-}
-
-/// The stand-in shown for `hwnd`, or null.
-fn stand_in_of(hwnd: HWND) -> HWND {
-    // SAFETY: a plain query; another window gives null.
-    unsafe { wm::GetPropW(hwnd, STAND_IN) }
-}
-
-/// A title shows its window: shows the stand-in instead. Returns whether it
-/// was visible before, as `ShowWindow` does.
-pub extern "system" fn ShowWindow(hwnd: HWND, command: i32) -> i32 {
-    let window = stand_in_of(hwnd);
-    let target = if window.is_null() { hwnd } else { window };
-    // SAFETY: the title's window, or our stand-in for it, whose thread
-    // always reads its messages, so this never waits long.
-    unsafe { wm::ShowWindow(target, command) }
-}
-
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -425,6 +344,26 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    note_shown(hwnd);
+}
+
+/// The title's window: the first of its top-level windows (no owner) seen
+/// visible. A close sent to it ends the title; one sent to another window
+/// of the title's (a helper it shows too) closes only that window.
+static TITLE_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Takes `hwnd` as [`TITLE_WINDOW`] if there is none yet and it is a
+/// visible top-level window.
+fn note_shown(hwnd: HWND) {
+    use std::sync::atomic::Ordering;
+    if TITLE_WINDOW.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    // SAFETY: both queries borrow a window of this thread's.
+    let top = unsafe { wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd };
+    if top {
+        let _ = TITLE_WINDOW.compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed);
+    }
 }
 
 extern "system" fn window_proc(
@@ -436,14 +375,33 @@ extern "system" fn window_proc(
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        note_close("SC_CLOSE");
         end_title("window closed", Box::new(|| {}));
         return 0;
+    }
+    // Automation and other applications can send WM_CLOSE directly. Only the
+    // title's window ends the title; owned dialogs, hidden helper windows and
+    // the title's other top-level windows handle their own close messages.
+    note_shown(hwnd);
+    let title_window = TITLE_WINDOW.load(std::sync::atomic::Ordering::Relaxed) == hwnd as usize;
+    if message == wm::WM_CLOSE && title_window {
+        note_close("WM_CLOSE to the title's window");
+        end_title("window closed", Box::new(|| {}));
+        return 0;
+    }
+    if title_window && switches_full_screen(message, wparam, lparam) {
+        toggle_full_screen(hwnd);
+        return 0;
+    }
+    if message == wm::WM_NCDESTROY && title_window {
+        // a window the title makes again is its window then
+        TITLE_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
-    // nothing shows it, since the window has no menu bar; Grand Theft Auto
-    // VI aborts itself about half a minute later. A console has no window
+    // nothing shows it, since the window has no menu bar;
+    // the title aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
@@ -451,31 +409,46 @@ extern "system" fn window_proc(
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
-        let window = stand_in_of(hwnd);
         if message == wm::WM_NCDESTROY {
             wm::RemovePropW(hwnd, TITLE_PROC);
-            if !window.is_null() {
-                wm::RemovePropW(hwnd, STAND_IN);
-                wm::PostMessageW(window, DESTROY_STAND_IN, 0, 0);
-            }
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
-        let result = wm::CallWindowProcW(title, hwnd, message, wparam, lparam);
-        // The stand-in shows the title's text. Its thread never waits for
-        // the title's, so this cannot deadlock.
-        if message == wm::WM_SETTEXT && !window.is_null() {
-            wm::SendMessageTimeoutW(
-                window,
-                wm::WM_SETTEXT,
-                0,
-                lparam,
-                wm::SMTO_ABORTIFHUNG,
-                1000,
-                std::ptr::null_mut(),
-            );
-        }
-        result
+        wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
     }
+}
+
+/// Says how a close arrived: sent from another thread (and whether that
+/// thread waits for the answer) or posted, and which process owns the
+/// window in front. Test sessions were closed minutes in by a close no one
+/// meant to send; this names the likely sender next time.
+fn note_close(how: &str) {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    // SAFETY: plain queries about this thread's message and the desktop.
+    let (flags, front, owner) = unsafe {
+        let flags = wm::InSendMessageEx(std::ptr::null());
+        let front = wm::GetForegroundWindow();
+        let mut owner = 0u32;
+        if !front.is_null() {
+            wm::GetWindowThreadProcessId(front, &mut owner);
+        }
+        (flags, front, owner)
+    };
+    let sent = match flags & (wm::ISMEX_SEND | wm::ISMEX_NOTIFY | wm::ISMEX_CALLBACK) {
+        0 => "posted, or sent by this thread",
+        f if f & wm::ISMEX_NOTIFY != 0 => "sent by another thread, which does not wait",
+        f if f & wm::ISMEX_CALLBACK != 0 => "sent by another thread, with a callback",
+        _ => "sent by another thread, which waits",
+    };
+    // SAFETY: a plain query.
+    let ours = unsafe { GetCurrentProcessId() };
+    tracing::info!(
+        how,
+        sent,
+        front = format_args!("{:#x}", front as usize),
+        front_process = owner,
+        this_process = ours,
+        "close received"
+    );
 }
 
 /// Suspends the title as the console does when it ends it, runs `then`
@@ -604,7 +577,6 @@ pub(crate) fn module() -> HleModule {
             hle_export!(UnregisterAppConstrainedChangeNotification),
             hle_export!(CreateWindowExW),
             hle_export!(CreateWindowExA),
-            hle_export!(ShowWindow),
         ],
     }
 }
@@ -614,6 +586,39 @@ mod tests {
     use super::*;
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
+
+    #[test]
+    fn full_screen_switches_both_ways_on_the_window_s_monitor() {
+        let windowed = (wm::WS_EX_WINDOWEDGE, wm::WS_OVERLAPPEDWINDOW, (100, 50, 1600, 900));
+        let monitor = RECT { left: 3840, top: 0, right: 3840 + 2560, bottom: 1440 };
+        // to full screen: a frameless popup over the monitor the window is on
+        let (ex, style, place) = toggled(false, windowed, monitor);
+        assert_eq!(place, (3840, 0, 2560, 1440));
+        assert_eq!(style, wm::WS_POPUP | wm::WS_VISIBLE);
+        assert_eq!(ex & wm::WS_EX_WINDOWEDGE, 0);
+        // and back: the window it was made as, shown
+        assert_eq!(toggled(true, windowed, monitor), (wm::WS_EX_WINDOWEDGE, wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE, (100, 50, 1600, 900)));
+        // the keys: F11, and Enter only with Alt
+        let alt = 1 << 29;
+        assert!(switches_full_screen(wm::WM_KEYDOWN, 0x7A, 0));
+        assert!(switches_full_screen(wm::WM_SYSKEYDOWN, 0x0D, alt));
+        assert!(!switches_full_screen(wm::WM_KEYDOWN, 0x0D, 0));
+        assert!(!switches_full_screen(wm::WM_SYSKEYDOWN, 0x0D, 0));
+    }
+
+    #[test]
+    fn a_full_screen_window_is_a_frameless_popup_over_the_screen() {
+        let framed = wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE;
+        let (ex, style, place) =
+            full_screen(wm::WS_EX_APPWINDOW | wm::WS_EX_WINDOWEDGE, framed, false, (3840, 2160)).unwrap();
+        assert_eq!(place, (0, 0, 3840, 2160));
+        assert_eq!(style, wm::WS_POPUP | wm::WS_VISIBLE);
+        assert_eq!(ex, wm::WS_EX_APPWINDOW);
+        // windows that keep their own place
+        assert!(full_screen(0, framed, true, (3840, 2160)).is_none());
+        assert!(full_screen(0, wm::WS_CHILD | wm::WS_VISIBLE, false, (3840, 2160)).is_none());
+        assert!(full_screen(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, false, (3840, 2160)).is_none());
+    }
 
     #[test]
     fn registrations_come_and_go() {
@@ -767,111 +772,72 @@ mod tests {
         }
     }
 
-    /// Whether `hwnd`'s thread answers a message within `ms`.
-    fn answers(hwnd: HWND, ms: u32) -> bool {
-        let mut result = 0;
-        // SAFETY: a plain message with a timeout.
-        unsafe {
-            wm::SendMessageTimeoutW(hwnd, wm::WM_NULL, 0, 0, wm::SMTO_NORMAL, ms, &mut result) != 0
-        }
-    }
-
-    fn thread_of(hwnd: HWND) -> u32 {
-        // SAFETY: a plain query.
-        unsafe { wm::GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) }
-    }
-
     #[test]
-    fn a_title_window_is_shown_through_a_stand_in_that_always_answers() {
-        // A "title thread" makes its window and then stops reading messages
-        // for a while, as a title does in a slow frame or a load.
-        let (made, window) = std::sync::mpsc::channel();
-        let (done, finish) = std::sync::mpsc::channel::<()>();
-        let title = std::thread::spawn(move || {
-            let null = std::ptr::null_mut();
-            let hwnd = CreateWindowExW(
-                0,
+    fn direct_close_suspends_and_exits() {
+        const CHILD: &str = "VICTORY_TEST_DIRECT_CLOSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "modules::lifecycle::tests::direct_close_suspends_and_exits",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "close test child failed: {stderr}");
+            assert!(stderr.contains("suspend routine ran"), "{stderr}");
+            return;
+        }
+
+        extern "system" fn record_suspend(_: u8, _: *mut c_void) {
+            eprintln!("suspend routine ran");
+        }
+
+        let null = std::ptr::null_mut();
+        let create = |owner| {
+            CreateWindowExW(
+                wm::WS_EX_NOACTIVATE | wm::WS_EX_TOOLWINDOW,
                 w!("STATIC"),
-                w!("stand-in"),
-                0,
-                0,
-                0,
+                w!("VIctory close test"),
+                wm::WS_VISIBLE | wm::WS_POPUP,
+                -10_000,
+                -10_000,
                 10,
                 10,
-                null,
+                owner,
                 null,
                 null,
                 std::ptr::null(),
-            );
-            made.send(hwnd as usize).unwrap();
-            let _ = finish.recv();
-            // SAFETY: this thread's window.
-            unsafe { wm::DestroyWindow(hwnd) };
-        });
-        let hwnd = window.recv().unwrap() as HWND;
-        assert!(!hwnd.is_null());
-        let stand_in = stand_in_of(hwnd);
-        assert!(!stand_in.is_null());
-        // SAFETY: plain queries of the two windows.
+            )
+        };
+        let title = create(null);
+        assert!(!title.is_null());
+        let dialog = create(title);
+        assert!(!dialog.is_null());
+        // a second visible top-level window of the title's, a helper
+        let helper = create(null);
+        assert!(!helper.is_null());
+        // SAFETY: the windows belong to this test thread. Closing the dialog
+        // or the helper goes to its original procedure and leaves the title
+        // window alive.
         unsafe {
-            // The title's window is message-only: it can never be shown.
-            assert_ne!(wm::GetAncestor(hwnd, wm::GA_PARENT), wm::GetDesktopWindow());
-            assert_eq!(
-                wm::GetAncestor(stand_in, wm::GA_PARENT),
-                wm::GetDesktopWindow()
-            );
-            assert_eq!(wm::IsWindowVisible(hwnd), 0);
-            let mut text = [0u16; 16];
-            let n = wm::GetWindowTextW(stand_in, text.as_mut_ptr(), 16);
-            assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "stand-in");
+            wm::SendMessageW(dialog, wm::WM_CLOSE, 0, 0);
+            assert_eq!(wm::IsWindow(dialog), 0);
+            wm::SendMessageW(helper, wm::WM_CLOSE, 0, 0);
+            assert_eq!(wm::IsWindow(helper), 0);
+            assert_ne!(wm::IsWindow(title), 0);
         }
-        assert_ne!(thread_of(stand_in), thread_of(hwnd));
-        assert!(!answers(hwnd, 200), "the title's thread is not reading");
-        assert!(answers(stand_in, 1000), "the stand-in's thread always is");
-        done.send(()).unwrap();
-        title.join().unwrap();
-        // The stand-in goes with the title's window.
-        let gone = (0..100).any(|_| {
-            std::thread::sleep(Duration::from_millis(10));
-            // SAFETY: a plain query; a destroyed handle gives false.
-            unsafe { wm::IsWindow(stand_in) == 0 }
-        });
-        assert!(gone);
-    }
-
-    #[test]
-    fn showing_a_title_window_shows_its_stand_in() {
-        let null = std::ptr::null_mut();
-        let hwnd = CreateWindowExW(
-            0,
-            w!("STATIC"),
-            w!("show"),
-            wm::WS_OVERLAPPEDWINDOW,
-            0,
-            0,
-            10,
-            10,
-            null,
-            null,
-            null,
-            std::ptr::null(),
+        let mut registration = 0;
+        assert_eq!(
+            RegisterAppStateChangeNotification(Some(record_suspend), null, &mut registration),
+            0
         );
-        let stand_in = stand_in_of(hwnd);
-        assert!(!stand_in.is_null());
-        // SAFETY: our windows. Minimised and not activated, so the test
-        // takes no focus from anything.
-        unsafe {
-            assert_eq!(ShowWindow(hwnd, wm::SW_SHOWMINNOACTIVE), 0);
-            assert_ne!(wm::IsWindowVisible(stand_in), 0);
-            assert_ne!(wm::IsIconic(stand_in), 0);
-            assert_eq!(wm::IsWindowVisible(hwnd), 0);
-            // The title's text follows it to the stand-in.
-            wm::SetWindowTextW(hwnd, w!("renamed"));
-            let mut text = [0u16; 16];
-            let n = wm::GetWindowTextW(stand_in, text.as_mut_ptr(), 16);
-            assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "renamed");
-            wm::DestroyWindow(hwnd);
-        }
+        // SAFETY: this thread owns the title window.
+        unsafe { wm::SendMessageW(title, wm::WM_CLOSE, 0, 0) };
+        std::thread::sleep(SUSPEND_DEADLINE + Duration::from_secs(1));
+        panic!("direct close did not exit the title process");
     }
 
     thread_local! {
