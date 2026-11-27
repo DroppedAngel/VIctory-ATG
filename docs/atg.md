@@ -57,8 +57,8 @@ Each was cherry-picked with `-x`, so its commit names the original.
 
 These are opt-in, or unmeasured with the title, and wait for a run on the 8 GB card:
 
-- Omega `ee8a23712` (`VICTORY_TEXTURE_DROP_MIPS`): two conflicts to resolve.
-- Omega `c9c31c7e1` (`VICTORY_GUARD_SPIN`): three conflicts.
+- Omega `ee8a23712` (dropping the largest mips of host textures): two conflicts to resolve.
+- Omega `c9c31c7e1` (the guards' lock spins before it sleeps): three conflicts.
 - Vice-Tay PR #92 (readback pool).
 - Omega `3615e6fb7` (2 MB refresh pieces).
 
