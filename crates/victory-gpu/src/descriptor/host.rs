@@ -3207,11 +3207,15 @@ impl HostHeap {
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
-        } else if let Some(cached) = cached_null_handle(NullKind::Tex2d) {
-            self.copy_from(index, cached);
         } else {
-            null_view(self.at(index));
-            self.put(index);
+            if let Some(cached) = cached_null_handle(NullKind::Tex2d) {
+                self.copy_from(index, cached);
+            } else {
+                null_view(self.at(index));
+                self.put(index);
+            }
+            // A null view has no format: shaders reading the slot's stride
+            // must not see the bits of the view it held before.
             self.write_stride(index, 0);
         }
         self.clear_twin(index);
