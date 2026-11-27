@@ -11,6 +11,11 @@ with a Ryzen 9 9950X3D and 48 GB of RAM, toward one goal: the open world at
 copy of the game. Vice-Tay is not affiliated with or endorsed by the game's
 developer or publisher.
 
+> [!NOTE]
+> **This is VIctory-ATG:** Vice-Tay with fixes from other forks, and a desktop
+> launcher set up for 8 GB NVIDIA cards. What was taken, and why:
+> [docs/atg.md](docs/atg.md).
+
 > [!TIP]
 > **[View the gameplay screenshots](https://github.com/TaynanGT/Vice-Tay-Screenshots#readme)**
 >
@@ -168,18 +173,20 @@ Then play on the Series S profile, the one every session above uses:
 scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
 ```
 
-`Play-VIctory.cmd` takes the same options from a Command Prompt; on a double-click
-PowerShell asks for the executable's path.
+`Play-VIctory.cmd` takes the same options from a Command Prompt. Without `-Exe` it
+starts the executable it started last time, or asks for it once.
+`scripts\install-desktop.ps1` puts a VIctory shortcut on the desktop and in the
+Start menu.
 
 | Option | What it does |
 |---|---|
-| (none) | Full screen, Series X profile, settings picked for your graphics card, performance panel on |
+| (none) | Full screen, settings picked for your graphics card and processor (Series S on cards of 12 GB or less), performance panel on |
 | **F11** or **Alt+Enter** | Switch between full screen and a window while it runs |
 | **F3** | Hide or show the performance panel |
 | `-NoPanel` | Start without the performance panel |
 | `-Windowed` | Start in a window |
 | `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster; the profile every session uses |
-| `-Machine 4090` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090) or AMD |
+| `-Machine 4090` / `4070` / `3070` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090; 4070 for 8-core processors; 3070 for 8 GB cards) or AMD |
 | `-Safe` | Leave out the changes still on trial; try it first when something goes wrong |
 | `-RayTracing` | Build the ray-traced structures, so the title's ray-traced indirect light runs |
 | `-Build release` | Run `target\release\victory.exe` (`cargo build --release --locked -p victory`); it has no panel |
